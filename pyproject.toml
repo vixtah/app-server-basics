@@ -1,6 +1,6 @@
 [project]
 name = "app-server-basics"
-version = "0.1.1"
+version = "0.1.2"
 description = "Server plumbing shared by the apps: heartbeats now; auth, SQLite helpers and polite outside-API calls later"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,7 +14,7 @@ fastapi = ["fastapi>=0.115"]
 dev = ["app-server-basics[fastapi]", "pytest>=8", "httpx>=0.27"]
 
 [tool.uv.sources]
-orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.2.2" }
+orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.2.3" }
 
 [build-system]
 requires = ["hatchling"]
