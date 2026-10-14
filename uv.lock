@@ -35,7 +35,7 @@ wheels = [
 
 [[package]]
 name = "app-server-basics"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "orbit-jobs" },
@@ -56,7 +56,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'fastapi'", specifier = ">=0.115" },
-    { name = "orbit-jobs", git = "https://github.com/vixtah/orbit-jobs?tag=v0.2.1" },
+    { name = "orbit-jobs", git = "https://github.com/vixtah/orbit-jobs?tag=v0.2.2" },
 ]
 provides-extras = ["fastapi"]
 
@@ -171,8 +171,8 @@ wheels = [
 
 [[package]]
 name = "orbit-jobs"
-version = "0.2.1"
-source = { git = "https://github.com/vixtah/orbit-jobs?tag=v0.2.1#687038e80c2c5ad81addd647655c61b36ef30257" }
+version = "0.2.2"
+source = { git = "https://github.com/vixtah/orbit-jobs?tag=v0.2.2#bdc3232714a5da65a4f766d3064294d6665b3172" }
 
 [[package]]
 name = "packaging"

@@ -11,13 +11,16 @@ The services come from three places, in this order:
 
 1. orbit-jobs ``health()`` over the app's schedule entries and hand-written loops
    (``orbit_jobs.schedules.Entry`` / ``Service``);
-2. systemd units the app names (:class:`SystemdUnit` or a unit name), read with
+2. systemd units the app names (:class:`SystemdUnit` or a unit name, and
+   :class:`SystemdTimer` for a timer plus the oneshot service it starts), read with
    ``systemctl show`` (no privileges);
 3. extra checks: callables the app passes, each returning one service dict.
 
 Nothing here raises: a broken source reports its services as ``unknown`` with the
 reason in ``last_error``. Every service carries exactly the contract's keys, errors
-are cut to 300 characters, and timestamps are UTC ``...Z``. Read-only; never reports
+are cut to 300 characters, and timestamps are UTC ``...Z``. ``expected_every_minutes``
+null means on demand: the service has no cadence, so it is never late; only a failed
+last run matters. Read-only; never reports
 secrets, payloads or message contents (extra checks must not put them in either).
 
 :func:`build_heartbeats` needs only orbit-jobs; :func:`heartbeats_router` needs
@@ -37,8 +40,8 @@ from typing import Any
 from orbit_jobs.schedules import Entry, Service, health
 
 __all__ = [
-    "ERROR_CHARS", "FIELDS", "STATUSES", "SystemdUnit", "build_heartbeats",
-    "heartbeats_router", "systemd_service",
+    "ERROR_CHARS", "FIELDS", "STATUSES", "SystemdTimer", "SystemdUnit", "build_heartbeats",
+    "heartbeats_router", "systemd_service", "systemd_timer_service",
 ]
 
 #: Errors are cut to this many characters.
@@ -53,7 +56,10 @@ STATUSES = frozenset({"ok", "failed", "running", "skipped", "unknown"})
 _TIMESTAMPS = ("last_run_at", "last_ok_at")
 _PROPS = ("LoadState,ActiveState,Result,ExecMainStatus,ActiveEnterTimestamp,NRestarts,"
           "ExecMainStartTimestamp,ExecMainExitTimestamp")
+_TIMER_PROPS = "LoadState,ActiveState,UnitFileState,LastTriggerUSec,NextElapseUSecRealtime"
 _SYSTEMCTL_TIMEOUT = 5
+#: A timer whose next run is this far in the past has stopped firing.
+TIMER_OVERDUE_MINUTES = 30
 
 Runner = Callable[..., subprocess.CompletedProcess]
 Check = Callable[[], dict[str, Any]]
@@ -67,9 +73,30 @@ class SystemdUnit:
 
     unit: str
     name: str | None = None
-    expected_every_minutes: float = 5
+    expected_every_minutes: float | None = 5
     where: str = "VPS"
     id: str | None = None
+
+
+@dataclass(frozen=True)
+class SystemdTimer:
+    """A systemd timer and the oneshot service it starts, reported as one service of
+    kind ``timer``. ``service`` defaults to the timer's own name with ``.service``
+    (systemd's default). ``id`` defaults to the timer unit and ``name`` to the id;
+    ``expected_every_minutes`` is the timer's cadence (a day by default)."""
+
+    timer: str
+    service: str | None = None
+    name: str | None = None
+    expected_every_minutes: float | None = 1440
+    where: str = "VPS"
+    id: str | None = None
+
+    @property
+    def service_unit(self) -> str:
+        if self.service:
+            return self.service
+        return self.timer.removesuffix(".timer") + ".service"
 
 
 # ── helpers ───────────────────────────────────────────────────────────
@@ -141,11 +168,11 @@ def _systemctl_time(value: str) -> datetime | None:
     return None
 
 
-def _show(unit: str, run: Runner) -> dict[str, str] | str:
+def _show(unit: str, run: Runner, props: str = _PROPS) -> dict[str, str] | str:
     """``systemctl show`` properties, or why they couldn't be read."""
     if run is subprocess.run and shutil.which("systemctl") is None:
         return "systemctl not available"
-    base = ["systemctl", "show", unit, "-p", _PROPS]
+    base = ["systemctl", "show", unit, "-p", props]
     out = None
     try:
         # --timestamp=utc needs systemd 247+; an older one rejects it, so retry without.
@@ -219,6 +246,80 @@ def systemd_service(unit: SystemdUnit | str, *, now: datetime | None = None,
                      "runs_24h": None, "failures_24h": None}, **fields)
 
 
+def systemd_timer_service(timer: SystemdTimer, *, now: datetime | None = None,
+                          run: Runner = subprocess.run) -> dict[str, Any]:
+    """One contract service (kind ``timer``) for a timer and the oneshot it starts.
+
+    The last run comes from the service: ``last_run_at`` is its last start (the timer's
+    last trigger when systemd no longer remembers the start, e.g. after a reboot),
+    ``last_ok_at`` the end of its last clean run, ``last_duration_ms`` that run's length.
+    ``last_status`` is ``running`` while the service runs, ``failed`` when its last run
+    failed, ``ok`` after a clean run and ``unknown`` before any run. The timer decides
+    whether more runs will come: a timer that is stopped, disabled, missing, has no
+    next run or is overdue by :data:`TIMER_OVERDUE_MINUTES` makes the service
+    ``failed`` with that reason (``last_ok_at`` stays the real last success, so a
+    collector also sees it late). ``runs_24h`` / ``failures_24h`` are None."""
+    at = now or datetime.now(UTC)
+    service_unit = timer.service_unit
+    fields = {"id": timer.id or timer.timer, "name": timer.name, "kind": "timer",
+              "where": timer.where, "expected_every_minutes": timer.expected_every_minutes}
+    tprops = _show(timer.timer, run, _TIMER_PROPS)
+    if isinstance(tprops, str):
+        return _unknown(fields["id"], tprops, **fields)
+    sprops = _show(service_unit, run)
+    if isinstance(sprops, str):
+        return _unknown(fields["id"], sprops, **fields)
+
+    started = _systemctl_time(sprops.get("ExecMainStartTimestamp", ""))
+    exited = _systemctl_time(sprops.get("ExecMainExitTimestamp", ""))
+    triggered = _systemctl_time(tprops.get("LastTriggerUSec", ""))
+    following = _systemctl_time(tprops.get("NextElapseUSecRealtime", ""))
+    state, result = sprops.get("ActiveState", ""), sprops.get("Result", "")
+    code = sprops.get("ExecMainStatus", "")
+    ran = started is not None and exited is not None and exited >= started
+
+    ok_at, error = None, None
+    if sprops.get("LoadState") == "not-found":
+        status, error = "failed", f"service {service_unit} not found"
+    elif state in ("activating", "deactivating", "reloading") or (state == "active" and not ran):
+        status = "running"  # an active oneshot that already exited is RemainAfterExit
+    elif state == "failed" or result not in ("", "success") or (ran and code not in ("", "0")):
+        status = "failed"
+        error = f"last run failed: result {result or 'unknown'}"
+        if code not in ("", "0"):
+            error += f", exit status {code}"
+    elif ran:
+        status, ok_at = "ok", exited
+    else:
+        status = "unknown"
+
+    problems = []
+    if tprops.get("LoadState") == "not-found":
+        problems.append(f"timer {timer.timer} not found: nothing starts {service_unit}")
+    elif tprops.get("ActiveState") != "active":
+        problems.append(f"timer {timer.timer} is stopped ({tprops.get('ActiveState') or 'unknown'}):"
+                        f" nothing starts {service_unit}")
+    else:
+        if tprops.get("UnitFileState") in ("disabled", "masked"):
+            problems.append(f"timer {timer.timer} is {tprops['UnitFileState']}:"
+                            " it won't start after a reboot")
+        if following is None:
+            problems.append(f"timer {timer.timer} has no next run scheduled")
+        elif (at - following).total_seconds() > TIMER_OVERDUE_MINUTES * 60:
+            problems.append(f"timer {timer.timer} is overdue: its run was due {_z(following)}")
+    if problems:
+        error = "; ".join([*problems, *([error] if error else [])])
+        status = "failed"
+
+    duration = None
+    if ran and status != "running":
+        duration = int((exited - started).total_seconds() * 1000)
+    last_run = max((t for t in (started, triggered) if t is not None), default=None)
+    return _service({"last_run_at": last_run, "last_ok_at": ok_at, "last_status": status,
+                     "last_error": error, "last_duration_ms": duration,
+                     "runs_24h": None, "failures_24h": None}, **fields)
+
+
 # ── the report ────────────────────────────────────────────────────────
 
 
@@ -254,26 +355,35 @@ def _from_check(check: Check) -> dict[str, Any]:
     return _service(raw, id=fallback)
 
 
+def _from_unit(unit: SystemdUnit | SystemdTimer | str, at: datetime,
+               run: Runner) -> dict[str, Any]:
+    if isinstance(unit, SystemdTimer):
+        return systemd_timer_service(unit, now=at, run=run)
+    return systemd_service(unit, now=at, run=run)
+
+
 def build_heartbeats(app: str, *, entries: Iterable[Entry | Service] = (),
-                     units: Iterable[SystemdUnit | str] = (), extra: Iterable[Check] = (),
+                     units: Iterable[SystemdUnit | SystemdTimer | str] = (),
+                     extra: Iterable[Check] = (),
                      where: str | None = None, now: datetime | None = None,
                      tick_minutes: float = 1, run: Runner = subprocess.run) -> dict[str, Any]:
     """The ``/heartbeats`` response: ``{app, generated_at, services}``.
 
     ``entries`` are orbit-jobs schedule entries and services (``kind`` defaults to
     ``scheduled`` for an Entry and ``loop`` for a Service; ``where`` to the ``where``
-    given here). ``units`` are systemd units, ``extra`` callables returning one
+    given here). ``units`` are systemd units and timers, ``extra`` callables returning one
     service dict each (missing keys become null). ``tick_minutes`` is how often the
     app's scheduler ticks (what a TICK entry expects)."""
     at = now or datetime.now(UTC)
     services = _from_orbit(list(entries), now, tick_minutes, where)
-    services += [systemd_service(u, now=at, run=run) for u in units]
+    services += [_from_unit(u, at, run) for u in units]
     services += [_from_check(check) for check in extra]
     return {"app": app, "generated_at": _z(at), "services": services}
 
 
 def heartbeats_router(app_name: str, *, entries: Iterable[Entry | Service] = (),
-                      units: Iterable[SystemdUnit | str] = (), extra: Iterable[Check] = (),
+                      units: Iterable[SystemdUnit | SystemdTimer | str] = (),
+                      extra: Iterable[Check] = (),
                       auth: Callable[..., Any], path: str = "/heartbeats",
                       where: str | None = None, tick_minutes: float = 1) -> Any:
     """A FastAPI ``APIRouter`` serving ``GET {path}`` (read-only) behind ``auth``, a
