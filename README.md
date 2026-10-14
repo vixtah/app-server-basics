@@ -12,7 +12,7 @@ Install it with uv from a git tag (it is not on PyPI):
 dependencies = ["app-server-basics[fastapi]"]
 
 [tool.uv.sources]
-app-server-basics = { git = "https://github.com/vixtah/app-server-basics", tag = "v0.1.3" }
+app-server-basics = { git = "https://github.com/vixtah/app-server-basics", tag = "v0.2.0" }
 ```
 
 It depends on [orbit-jobs](https://github.com/vixtah/orbit-jobs) (the shared job
@@ -24,7 +24,7 @@ leave out `[fastapi]` if you only need the non-web parts.
 | Module | What it is for |
 |--------|----------------|
 | `app_server_basics.heartbeats` | `GET /heartbeats`: how every scheduled job, loop and systemd unit the app runs is doing. |
-| `app_server_basics.auth` | *Coming.* The owner/admin gate every app now writes itself. |
+| `app_server_basics.auth` | Who may call the server: tunnel and home-network rules, tokens, owner-only routes, tokens kept out of logs. |
 | `app_server_basics.sqlite` | *Coming.* SQLite connection helpers. |
 | `app_server_basics.http` | *Coming.* Polite calls to outside APIs (rate limits, backoff, cooldowns). |
 
@@ -134,6 +134,98 @@ Entries default to kind `scheduled` and services to `loop`, unless they declare
 unit's or timer's `runs_24h` and `failures_24h` are null. A timer whose service
 started before the last reboot has no recorded outcome: `unknown`, with
 `last_run_at` from the timer's last trigger.
+
+## Auth
+
+Every app answers two kinds of callers: its own app (anywhere, through the public
+Cloudflare tunnel or at home) and the owner (operational routes: feedback triage,
+heartbeats, admin screens). `app_server_basics.auth` holds the rules they share.
+
+**The two rules.**
+
+- `through_tunnel(headers)`: did the request come through the public tunnel? Cloudflare
+  puts a `Cf-Connecting-Ip` header on every tunnel request; Wi-Fi, Tailscale and local
+  requests have none. Faking the header only makes a request less trusted.
+- `private_address(host)` / `client_host(request)`: is the caller on a private network
+  (loopback, home network ranges, Tailscale `100.64.0.0/10` and `fd7a:115c:a1e0::/48`,
+  IPv6 unique-local, link-local)? Only the connection's own address counts, as Uvicorn
+  reports it. `X-Forwarded-For` and similar headers are never read.
+
+**Tokens.** `Tokens(...)` says which tokens are accepted and where a request carries them:
+
+- `env`: the variable with the app's own token (read on every check);
+- `hashes_env`: a variable with SHA-256 hashes of more tokens, comma-separated
+  (`hash_token("...")` makes one);
+- `lookup`: for per-user tokens the app stores (as hashes): a function from a token's
+  hash to who it belongs to, or None;
+- `header`: the header carrying it (`x-app-token` by default; Riftbound's `x-rift-token`);
+- `deprecated_query`: a query parameter old clients still use (`"token"`). Off by
+  default; when used, the server logs one warning (without the token).
+
+Comparisons are constant-time, and no token is put into an error, a log line or a
+response body. The one exception is `TokenGate`'s optional session cookie, which hands
+the token back only to the client that just sent it.
+
+**Gates.**
+
+| Piece | For |
+|-------|-----|
+| `require_token(tokens)` | FastAPI dependency: a valid token on every transport (401). Returns who it belongs to. |
+| `require_owner(tokens)` | FastAPI dependency for owner-only routes: never through the tunnel, only from a private network, and with a valid token. Tunnel or public callers get 404 (so the route doesn't advertise itself), a private caller without a token 401. Statuses, messages and allowed identities are parameters. |
+| `TokenGate` | ASGI middleware for apps that trust direct connections: tunnel requests need a token, everything else passes. Exempt hostnames (behind Cloudflare Access) and an optional session cookie for web views, which must come from the same site to write or open a WebSocket. |
+| `install_log_redaction()` | A logging filter that hides `?token=` values and token headers in Uvicorn's request lines, the app's own log lines and tracebacks. Call it before `uvicorn.run`. |
+
+**One example per kind of app.**
+
+An app whose every request needs its token, with owner-only routes (CardScanner, Reserve):
+
+```python
+from app_server_basics.auth import Tokens, install_log_redaction, require_owner, require_token
+
+TOKENS = Tokens(env="CARDS_ACCESS_TOKEN", hashes_env="CARDS_ACCESS_TOKEN_HASHES")
+app.include_router(api, dependencies=[Depends(require_token(TOKENS))])
+app.include_router(heartbeats_router("cardscanner", auth=require_owner(TOKENS)))
+install_log_redaction()
+```
+
+An app with one token per player stored as hashes (Riftbound):
+
+```python
+TOKENS = Tokens(header="x-rift-token", deprecated_query="token", lookup=store.name_for_hash)
+player = Depends(require_token(TOKENS))                # the invite's name
+admin = Depends(require_owner(TOKENS, identities=ADMIN_NAMES))
+install_log_redaction(headers=("x-rift-token",))
+uvicorn.run(app, ...)
+```
+
+An app whose home connections are trusted and whose tunnel needs a token (Tasks):
+
+```python
+app.add_middleware(TokenGate, tokens=Tokens(env="TASKS_ACCESS_TOKEN"),
+                   exempt_hosts={"hellodash.cc", "www.hellodash.cc"},
+                   cookie="tasks_session")
+install_log_redaction(params=("token", "tasks_session"))
+uvicorn.run(app, ...)
+```
+
+### Public API
+
+- `TUNNEL_HEADER`, `PRIVATE_NETWORKS`: the header and address ranges the two rules use.
+- `through_tunnel(headers, header=TUNNEL_HEADER)`, `private_address(host)`,
+  `client_host(request_or_scope)`.
+- `hash_token(token)`: SHA-256 hex.
+- `Tokens(env=None, hashes_env=None, lookup=None, identity="owner", header="x-app-token", deprecated_query=None)`
+  with `match(token)`, `amatch(token)` (lookup off the event loop), `given(request)` and
+  `identify(request)`.
+- `require_token(tokens, *, status=401, detail=...)`.
+- `require_owner(tokens, *, refuse_status=404, refuse_detail="Not Found", token_status=401, token_detail=..., identities=None, tunnel_header=TUNNEL_HEADER)`.
+- `TokenGate(app, *, tokens, exempt_hosts=(), cookie=None, tunnel_header=TUNNEL_HEADER, detail=..., ws_close_code=4401)`;
+  the matched identity is in `request.state.token_identity` for tunnel requests.
+- `install_log_redaction(*, loggers=UVICORN_LOGGERS, root=True, params=("token",), headers=("x-app-token", "x-rift-token"))`,
+  `RedactTokens` (the filter), `redact(text, params, headers)`.
+
+Everything but `require_token` and `require_owner` (which import FastAPI) is standard
+library only.
 
 ## Developing
 

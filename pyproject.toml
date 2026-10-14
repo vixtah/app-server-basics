@@ -1,17 +1,18 @@
 [project]
 name = "app-server-basics"
-version = "0.1.3"
-description = "Server plumbing shared by the apps: heartbeats now; auth, SQLite helpers and polite outside-API calls later"
+version = "0.2.0"
+description = "Server plumbing shared by the apps: heartbeats and auth now; SQLite helpers and polite outside-API calls later"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["orbit-jobs"]
 
 [project.optional-dependencies]
-# app_server_basics.heartbeats.heartbeats_router (the FastAPI route).
+# app_server_basics.heartbeats.heartbeats_router (the FastAPI route) and
+# app_server_basics.auth.require_token / require_owner (FastAPI dependencies).
 fastapi = ["fastapi>=0.115"]
 
 [dependency-groups]
-dev = ["app-server-basics[fastapi]", "pytest>=8", "httpx>=0.27"]
+dev = ["app-server-basics[fastapi]", "pytest>=8", "httpx>=0.27", "uvicorn>=0.30"]
 
 [tool.uv.sources]
 orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.2.3" }
