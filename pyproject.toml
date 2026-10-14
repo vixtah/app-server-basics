@@ -1,0 +1,27 @@
+[project]
+name = "app-server-basics"
+version = "0.1.0"
+description = "Server plumbing shared by the apps: heartbeats now; auth, SQLite helpers and polite outside-API calls later"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["orbit-jobs"]
+
+[project.optional-dependencies]
+# app_server_basics.heartbeats.heartbeats_router (the FastAPI route).
+fastapi = ["fastapi>=0.115"]
+
+[dependency-groups]
+dev = ["app-server-basics[fastapi]", "pytest>=8", "httpx>=0.27"]
+
+[tool.uv.sources]
+orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.2.1" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/app_server_basics"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
