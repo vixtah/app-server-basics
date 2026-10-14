@@ -12,7 +12,7 @@ Install it with uv from a git tag (it is not on PyPI):
 dependencies = ["app-server-basics[fastapi]"]
 
 [tool.uv.sources]
-app-server-basics = { git = "https://github.com/vixtah/app-server-basics", tag = "v0.1.2" }
+app-server-basics = { git = "https://github.com/vixtah/app-server-basics", tag = "v0.1.3" }
 ```
 
 It depends on [orbit-jobs](https://github.com/vixtah/orbit-jobs) (the shared job

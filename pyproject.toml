@@ -1,6 +1,6 @@
 [project]
 name = "app-server-basics"
-version = "0.1.2"
+version = "0.1.3"
 description = "Server plumbing shared by the apps: heartbeats now; auth, SQLite helpers and polite outside-API calls later"
 readme = "README.md"
 requires-python = ">=3.12"

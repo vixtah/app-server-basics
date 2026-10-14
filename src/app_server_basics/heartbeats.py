@@ -256,7 +256,8 @@ def systemd_timer_service(timer: SystemdTimer, *, now: datetime | None = None,
     ``last_status`` is ``running`` while the service runs, ``failed`` when its last run
     failed, ``ok`` after a clean run and ``unknown`` before any run. The timer decides
     whether more runs will come: a timer that is stopped, disabled, missing, has no
-    next run or is overdue by :data:`TIMER_OVERDUE_MINUTES` makes the service
+    next run (except while its service runs: a timer counting from its service's
+    start, ``OnUnitActiveSec=``, schedules the next run only once it ends) or is overdue by :data:`TIMER_OVERDUE_MINUTES` makes the service
     ``failed`` with that reason (``last_ok_at`` stays the real last success, so a
     collector also sees it late). ``runs_24h`` / ``failures_24h`` are None."""
     at = now or datetime.now(UTC)
@@ -303,8 +304,11 @@ def systemd_timer_service(timer: SystemdTimer, *, now: datetime | None = None,
         if tprops.get("UnitFileState") in ("disabled", "masked"):
             problems.append(f"timer {timer.timer} is {tprops['UnitFileState']}:"
                             " it won't start after a reboot")
+        # A timer counting from its service (OnUnitActiveSec=, OnUnitInactiveSec=) has no
+        # next run while that service runs: systemd schedules it once the run ends.
         if following is None:
-            problems.append(f"timer {timer.timer} has no next run scheduled")
+            if status != "running":
+                problems.append(f"timer {timer.timer} has no next run scheduled")
         elif (at - following).total_seconds() > TIMER_OVERDUE_MINUTES * 60:
             problems.append(f"timer {timer.timer} is overdue: its run was due {_z(following)}")
     if problems:

@@ -10,4 +10,4 @@ Coming: ``auth`` (the owner/admin gate), ``sqlite`` (connection helpers) and ``h
 FastAPI except the route factories, which import it when called.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"

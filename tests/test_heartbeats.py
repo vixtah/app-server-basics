@@ -223,6 +223,15 @@ def test_timer_while_its_service_runs():
         "running", "2026-10-13T21:59:00Z", None)
 
 
+def test_a_timer_counting_from_its_service_has_no_next_run_while_it_runs():
+    # OnUnitActiveSec=1h: systemd schedules the next run only once the service ends.
+    running = ONESHOT_OK.replace("ActiveState=inactive", "ActiveState=activating").replace(
+        "ExecMainStartTimestamp=Tue 2026-10-13 11:39:36", "ExecMainStartTimestamp=Tue 2026-10-13 21:59:00")
+    s = timer(TIMER_ON.replace("NextElapseUSecRealtime=Wed 2026-10-14 11:43:35 UTC",
+                               "NextElapseUSecRealtime="), running)
+    assert (s["last_status"], s["last_error"]) == ("running", None)
+
+
 @pytest.mark.parametrize(("timer_props", "error"), [
     (TIMER_ON.replace("ActiveState=active", "ActiveState=inactive"),
      "timer cards-backup.timer is stopped (inactive): nothing starts cards-backup.service"),
