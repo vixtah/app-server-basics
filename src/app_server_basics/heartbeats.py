@@ -34,12 +34,13 @@ FastAPI (the ``fastapi`` extra) and imports it when called.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from orbit_jobs.redact import redact
@@ -62,7 +63,8 @@ STATUSES = frozenset({"ok", "failed", "running", "skipped", "unknown"})
 _TIMESTAMPS = ("last_run_at", "last_ok_at")
 _PROPS = ("LoadState,ActiveState,Result,ExecMainStatus,ActiveEnterTimestamp,NRestarts,"
           "ExecMainStartTimestamp,ExecMainExitTimestamp")
-_TIMER_PROPS = "LoadState,ActiveState,UnitFileState,LastTriggerUSec,NextElapseUSecRealtime"
+_TIMER_PROPS = ("LoadState,ActiveState,UnitFileState,LastTriggerUSec,NextElapseUSecRealtime,"
+                "NextElapseUSecMonotonic")
 _SYSTEMCTL_TIMEOUT = 5
 #: A timer whose next run is this far in the past has stopped firing.
 TIMER_OVERDUE_MINUTES = 30
@@ -186,6 +188,44 @@ def _systemctl_time(value: str) -> datetime | None:
     return None
 
 
+# systemd's time spans (``4d 9h 21min 17.992424s``), in seconds per unit.
+_SPAN_UNITS = {"y": 31557600, "month": 2629800, "w": 604800, "d": 86400, "h": 3600,
+               "min": 60, "s": 1, "ms": 1e-3, "us": 1e-6}
+_SPAN_PART = re.compile(r"(\d+(?:\.\d+)?)(month|min|ms|us|y|w|d|h|s)")
+
+
+def _monotonic() -> float:
+    """This machine's monotonic clock (systemd's ``CLOCK_MONOTONIC``), in seconds."""
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+def _timespan(value: str) -> float | None:
+    """A systemd time span in seconds; None when it doesn't read as one."""
+    parts = value.split()
+    total = 0.0
+    for part in parts:
+        m = _SPAN_PART.fullmatch(part)
+        if m is None:
+            return None
+        total += float(m[1]) * _SPAN_UNITS[m[2]]
+    return total if parts else None
+
+
+def _next_monotonic(value: str, at: datetime) -> tuple[bool, datetime | None]:
+    """``NextElapseUSecMonotonic`` (a time since boot, e.g. ``4d 9h 21min 17.99s``) of a
+    timer counting from boot or from its service (``OnBootSec=``, ``OnUnitActiveSec=``),
+    which leaves ``NextElapseUSecRealtime`` empty: whether a next run is scheduled, and
+    when on the wall clock (``at`` plus how far it is ahead of the monotonic clock), or
+    None when the span doesn't read."""
+    value = value.strip()
+    if value in ("", "0", "infinity", "n/a"):
+        return False, None
+    seconds = _timespan(value)
+    if seconds is None:
+        return True, None
+    return True, at + timedelta(seconds=seconds - _monotonic())
+
+
 def _show(unit: str, run: Runner, props: str = _PROPS) -> dict[str, str] | str:
     """``systemctl show`` properties, or why they couldn't be read."""
     if run is subprocess.run and shutil.which("systemctl") is None:
@@ -304,7 +344,9 @@ def systemd_timer_service(timer: SystemdTimer, *, now: datetime | None = None,
     failed, ``ok`` after a clean run and ``unknown`` before any run. The timer decides
     whether more runs will come: a timer that is stopped, disabled, missing, has no
     next run (except while its service runs: a timer counting from its service's
-    start, ``OnUnitActiveSec=``, schedules the next run only once it ends) or is overdue by :data:`TIMER_OVERDUE_MINUTES` makes the service
+    start, ``OnUnitActiveSec=``, schedules the next run only once it ends; a timer
+    counting from boot or its service has its next run on the monotonic clock, read
+    against this machine's) or is overdue by :data:`TIMER_OVERDUE_MINUTES` makes the service
     ``failed`` with that reason (``last_ok_at`` stays the real last success, so a
     collector also sees it late). ``runs_24h`` / ``failures_24h`` are None, unless
     the timer names its service's recorded ``runs``."""
@@ -328,6 +370,9 @@ def _systemd_timer_service(timer: SystemdTimer, now: datetime | None,
     exited = _systemctl_time(sprops.get("ExecMainExitTimestamp", ""))
     triggered = _systemctl_time(tprops.get("LastTriggerUSec", ""))
     following = _systemctl_time(tprops.get("NextElapseUSecRealtime", ""))
+    scheduled = following is not None
+    if not scheduled:
+        scheduled, following = _next_monotonic(tprops.get("NextElapseUSecMonotonic", ""), at)
     state, result = sprops.get("ActiveState", ""), sprops.get("Result", "")
     code = sprops.get("ExecMainStatus", "")
     ran = started is not None and exited is not None and exited >= started
@@ -359,10 +404,10 @@ def _systemd_timer_service(timer: SystemdTimer, now: datetime | None,
                             " it won't start after a reboot")
         # A timer counting from its service (OnUnitActiveSec=, OnUnitInactiveSec=) has no
         # next run while that service runs: systemd schedules it once the run ends.
-        if following is None:
+        if not scheduled:
             if status != "running":
                 problems.append(f"timer {timer.timer} has no next run scheduled")
-        elif (at - following).total_seconds() > TIMER_OVERDUE_MINUTES * 60:
+        elif following is not None and (at - following).total_seconds() > TIMER_OVERDUE_MINUTES * 60:
             problems.append(f"timer {timer.timer} is overdue: its run was due {_z(following)}")
     if problems:
         error = "; ".join([*problems, *([error] if error else [])])

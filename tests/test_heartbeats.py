@@ -252,6 +252,43 @@ def test_a_timer_that_wont_fire_again_is_failed_not_ok(timer_props, error):
     assert s["last_ok_at"] == "2026-10-13T11:39:38Z"
 
 
+# OnBootSec= / OnUnitActiveSec=: no realtime next run, the next one is on the monotonic clock.
+MONOTONIC = TIMER_ON.replace("NextElapseUSecRealtime=Wed 2026-10-14 11:43:35 UTC",
+                             "NextElapseUSecRealtime=\nNextElapseUSecMonotonic=4d 9h 21min 17.992424s")
+BOOTED = 4 * 86400 + 8 * 3600 + 30 * 60  # the monotonic clock now: 4d 8h 30min
+
+
+def test_a_timer_counting_from_boot_or_its_service_is_scheduled(monkeypatch):
+    monkeypatch.setattr(hb, "_monotonic", lambda: BOOTED)
+    s = timer(MONOTONIC)
+    assert (s["last_status"], s["last_error"]) == ("ok", None)
+
+
+def test_a_monotonic_timer_that_stopped_firing_is_overdue(monkeypatch):
+    monkeypatch.setattr(hb, "_monotonic", lambda: BOOTED + 2 * 3600)  # 69 min past its run
+    s = timer(MONOTONIC)
+    assert s["last_status"] == "failed"
+    assert s["last_error"] == "timer cards-backup.timer is overdue: its run was due 2026-10-13T20:51:17Z"
+
+
+@pytest.mark.parametrize("value", ["infinity", "0", ""])
+def test_a_monotonic_timer_with_no_next_run_is_failed(value):
+    s = timer(MONOTONIC.replace("4d 9h 21min 17.992424s", value))
+    assert (s["last_status"], s["last_error"]) == (
+        "failed", "timer cards-backup.timer has no next run scheduled")
+
+
+def test_an_unreadable_monotonic_next_run_still_counts_as_scheduled():
+    s = timer(MONOTONIC.replace("4d 9h 21min 17.992424s", "soon"))
+    assert (s["last_status"], s["last_error"]) == ("ok", None)
+
+
+def test_systemd_time_spans():
+    assert hb._timespan("4d 9h 21min 17.5s") == 4 * 86400 + 9 * 3600 + 21 * 60 + 17.5
+    assert hb._timespan("1month 2w 300ms 7us") == pytest.approx(2629800 + 2 * 604800 + 0.300007)
+    assert hb._timespan("5min") == 300 and hb._timespan("") is None
+    assert hb._timespan("5 min") is None
+
 def test_a_stopped_timer_keeps_the_services_own_failure():
     failed = ONESHOT_OK.replace("Result=success", "Result=exit-code").replace(
         "ExecMainStatus=0", "ExecMainStatus=1")
@@ -292,6 +329,7 @@ def test_timer_reads_only_the_properties_it_needs():
     systemd_timer_service(BACKUP, now=NOW, run=run)
     timer_call, service_call = run.calls
     assert timer_call[2] == "cards-backup.timer" and "NextElapseUSecRealtime" in timer_call[4]
+    assert "NextElapseUSecMonotonic" in timer_call[4]
     assert service_call[2] == "cards-backup.service" and "ExecMainExitTimestamp" in service_call[4]
 
 

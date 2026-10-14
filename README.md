@@ -57,6 +57,9 @@ It collects services from three places:
    `timer` (`SystemdTimer`): the last run, its length and outcome come from the
    service, and a timer that is stopped, disabled, missing or overdue is `failed`
    with that reason (its `last_ok_at` stays the real last success, never "now").
+   A timer counting from boot or from its service (`OnBootSec=`, `OnUnitActiveSec=`)
+   has its next run on the monotonic clock (`NextElapseUSecMonotonic`), read against
+   the machine's own.
    A unit or timer whose process also records its own runs with `record_run` (the
    server's lifetime, each backup) names them with `runs=`: the report then has the
    live state from systemd plus the 24-hour run and failure counts from those
