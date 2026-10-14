@@ -1,7 +1,7 @@
 [project]
 name = "app-server-basics"
-version = "0.2.1"
-description = "Server plumbing shared by the apps: heartbeats and auth now; SQLite helpers and polite outside-API calls later"
+version = "0.3.0"
+description = "Server plumbing shared by the apps: heartbeats, auth, SQLite helpers and polite outside-API calls"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["orbit-jobs>=0.2.4"]

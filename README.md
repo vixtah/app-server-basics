@@ -25,8 +25,8 @@ leave out `[fastapi]` if you only need the non-web parts.
 |--------|----------------|
 | `app_server_basics.heartbeats` | `GET /heartbeats`: how every scheduled job, loop and systemd unit the app runs is doing. |
 | `app_server_basics.auth` | Who may call the server: tunnel and home-network rules, tokens, owner-only routes, tokens kept out of logs. |
-| `app_server_basics.sqlite` | *Coming.* SQLite connection helpers. |
-| `app_server_basics.http` | *Coming.* Polite calls to outside APIs (rate limits, backoff, cooldowns). |
+| `app_server_basics.sqlite` | SQLite connections with the apps' settings, the worktree guard on live files, added columns, migrations, leases. |
+| `app_server_basics.http` | Polite calls to outside APIs: cooldowns on 429, growing pauses for hosts that refuse the server, per-host request counts. |
 
 ## Heartbeats
 
@@ -235,6 +235,132 @@ uvicorn.run(app, ...)
 
 Everything but `require_token` and `require_owner` (which import FastAPI) is standard
 library only.
+
+## SQLite
+
+Every app opens its SQLite files the same way: WAL, a busy timeout
+(`AUTOMATIONS_SQLITE_BUSY_TIMEOUT_MS`, default 30 000), `sqlite3.Row` rows, and foreign
+keys off unless asked for. Code running from a git worktree (an agent's checkout) opens
+the app's **live** file read-only, so an agent never writes production data by
+accident; `AUTOMATIONS_ALLOW_LIVE_DB_WRITES=1` lifts that. Each app keeps its own paths
+and schemas and tells the guard where its code lives:
+
+```python
+from app_server_basics import sqlite as db
+
+LIVE = Path.home() / ".local/share/automations/reserve.db"
+DB_PATH = Path(os.environ.get("AUTOMATIONS_RESERVE_DB_PATH") or LIVE)
+
+conn, guarded = db.connect(DB_PATH, live_path=LIVE, checkout=__file__)
+if not guarded:                                # a guarded connection skips DDL
+    conn.execute("CREATE TABLE IF NOT EXISTS venues (id TEXT PRIMARY KEY, data TEXT)")
+    db.ensure_columns(conn, "venues", {"enrichment": "TEXT"})
+    db.apply_migrations(conn, "reserve", [(1, migrate_one), (2, migrate_two)])
+```
+
+### Public API
+
+- `connect(path, *, live_path=None, checkout=None, timeout=None, foreign_keys=False)`:
+  `(conn, guarded)`, with the parent directory made, the guard or the pragmas applied.
+- `configure(conn, *, foreign_keys=False)`: WAL and the busy timeout on a connection;
+  `busy_timeout_ms()`.
+- `guarded_connect(path, *, live_path, checkout, timeout=5.0)`: `(conn, guarded)` without
+  pragmas; `guard_active_for(path, live_path, *, checkout)`; `in_worktree(checkout)`.
+- `ensure_columns(conn, table, {column: ddl})`: add the columns a live table lacks
+  (returns the ones added).
+- `apply_migrations(conn, module, [(version, fn), ...])`: run each numbered migration once
+  per database (`schema_migrations`), in order (returns the versions run).
+- `create_lease_table(conn, table="leases")`, `acquire_lease(conn, key, owner, seconds=900, *, table="leases")`,
+  `release_lease(conn, key, owner, *, table="leases")`: one owner per key across
+  processes; an expired lease (a crashed owner) is taken over. The caller commits.
+- `now_iso()`: UTC ISO timestamp for writes; `simulated_clock(fn)` replaces it in tests.
+
+Standard library only.
+
+## Polite outside-API calls
+
+`app_server_basics.http` keeps an app from hammering the sites it reads, and shows how
+each site is doing. Per host, kept in the app's own SQLite file so restarts, deploys and
+other processes see the same state:
+
+- **Cooldowns.** A 429 stops the host until its `Retry-After` (seconds or an HTTP date),
+  within the policy's minimum and maximum. No request is sent meanwhile, and a 429 is
+  never retried at once (that is what extends a ban).
+- **Pauses.** A host that refuses the server (403, or a page the caller says is a bot wall
+  instead of data) is paused from the second refusal in a row: 1 hour, then 2, 4, 8, 16,
+  at most 24. The count is remembered 30 days after the pause, so expiry or a restart
+  doesn't start over; only a success on the request that was refused (same method and
+  path) clears it.
+- **Counts.** Every request sent is counted (status, or `timeout`/`transport`); skipped
+  ones are not. `Hosts.stats()` gives each host's last 24 hours.
+- **No secrets in errors.** A refusal is remembered as `METHOD /path`, never the query;
+  `describe_error(exc)` is a redacted one-line error (`orbit_jobs.redact`).
+
+The rules are a `Policy`; the defaults are Reserve's. CardScanner's news sources use a
+daily one:
+
+```python
+DAILY = Policy(cooldown_statuses=frozenset({403, 429}), cooldown_default=0,
+               cooldown_min=0, cooldown_max=None, cooldown_until_utc_midnight=True,
+               retry_after_any_status=True, block_statuses=frozenset())
+```
+
+It works with any HTTP library: `PoliteClient` needs a `send(method, url, **kwargs)`
+returning a response with `status_code` and `headers` (`httpx.request`, an
+`httpx.Client`'s or a curl_cffi `Session`'s `request`).
+
+```python
+from app_server_basics import http
+
+# In the app's schema setup, on its own database:
+http.create_tables(conn)
+
+HOSTS = http.Hosts(store.connection, http.Policy())   # connect(): a context manager
+client = http.PoliteClient(HOSTS, httpx.request, retries=2)
+
+try:
+    response = client.request("GET", "https://api.example.com/sheet?key=...", timeout=20,
+                              refused=lambda r: "HTML instead of data"
+                              if "html" in r.headers.get("content-type", "") else None)
+    response.raise_for_status()
+except http.HostUnavailable as exc:                  # CoolingDown or Blocked: not sent
+    ...
+```
+
+`Hosts.stats()` is one entry per host with requests in the last 7 days or a cooldown or
+remembered refusal now, in the shape of Reserve's `/api/reserve/sources`:
+
+```json
+{"id": "hardingpark.ezlinksgolf.com", "host": "hardingpark.ezlinksgolf.com",
+ "requests_24h": 5, "ok_24h": 3, "rate_limited_24h": 0, "rejected_24h": 2, "errors_24h": 0,
+ "last_status_code": 403, "last_ok_at": "2026-10-13T21:10:04Z",
+ "cooldown_until": "2026-10-14T03:36:26Z", "status": "blocked",
+ "note": "refuses this server (HTTP 403); paused until 2026-10-14T03:36:26Z"}
+```
+
+`status` is the first match of `blocked` (paused now, or mostly 401/403 in 24 hours),
+`rate_limited` (cooling down now, or a 429 in the last hour), `failing` (mostly 5xx or
+no answer), `idle` (no requests in 24 hours), else `ok`. `cooldown_until` is the later of
+the cooldown and the pause. The app adds its own names and groups (`id`).
+
+### Public API
+
+- `Policy(cooldown_statuses={429}, cooldown_default=300, cooldown_min=60, cooldown_max=21600, cooldown_until_utc_midnight=False, retry_after_any_status=False, block_statuses={403}, block_after=2, block_first=3600, block_cap=86400, block_memory=2592000, keep_attempts=604800)`.
+- `Hosts(connect, policy=None, *, key=None, clock=None, scope=None, batch=200, flush_seconds=30)`:
+  `key(url)`, `state(url)`, `check(method, url)` (raises `CoolingDown` / `Blocked`),
+  `cooldown(url, status, headers)`, `refuse(method, url, reason)` (returns the `Blocked`
+  to raise), `accept(method, url, state)`, `states(now=None)`, `record(url, status=None, error=None)`,
+  `flush()`, `stats(now=None, *, window=86400, recent=3600)`. `key` maps a host name to the
+  bucket its state and counts are kept under; `scope` names the database counts belong
+  to (tests that repoint it).
+- `PoliteClient(hosts, send, retries=0, backoff=..., pace=None)` with
+  `request(method, url, *, refused=None, **kwargs)`.
+- `HostUnavailable` (`host`, `until`, `status_code`, `reason`), `CoolingDown`, `Blocked`.
+- `HostState`; `create_tables(conn)`, `read_state(conn, host, now)`,
+  `merge_state(conn, state, now=None)` (to import an app's older records).
+- `retry_after(value, now=None)`, `host_of(url)`, `request_label(method, url)`,
+  `redact_url(url)`, `error_category(exc)`, `describe_error(exc)`; `STATS_FIELDS`,
+  `STATUSES`.
 
 ## Developing
 
