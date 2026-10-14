@@ -16,9 +16,14 @@ The services come from three places, in this order:
    ``systemctl show`` (no privileges);
 3. extra checks: callables the app passes, each returning one service dict.
 
+A unit or timer may name its own ``record_run`` history (``runs=``): its live state
+from systemd then carries that history's 24-hour counts (and its last run when
+systemd knows nothing).
+
 Nothing here raises: a broken source reports its services as ``unknown`` with the
 reason in ``last_error``. Every service carries exactly the contract's keys, errors
-are cut to 300 characters, and timestamps are UTC ``...Z``. ``expected_every_minutes``
+are redacted (``orbit_jobs.redact``) and cut to 300 characters, and timestamps are
+UTC ``...Z``. ``expected_every_minutes``
 null means on demand: the service has no cadence, so it is never late; only a failed
 last run matters. Read-only; never reports
 secrets, payloads or message contents (extra checks must not put them in either).
@@ -37,6 +42,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from orbit_jobs.redact import redact
 from orbit_jobs.schedules import Entry, Service, health
 
 __all__ = [
@@ -69,13 +75,21 @@ Check = Callable[[], dict[str, Any]]
 class SystemdUnit:
     """A systemd unit the app owns. ``id`` defaults to the unit name and ``name``
     (shown to the owner) to the id. ``expected_every_minutes`` matters for
-    timer-run units; an always-on unit that is up counts as ok right now."""
+    timer-run units; an always-on unit that is up counts as ok right now.
+
+    ``runs`` names the orbit-jobs service (a ``Service`` or its name) whose
+    ``record_run`` history belongs to this unit (e.g. ``record_run`` around the
+    server's lifetime): the report then carries that history's ``runs_24h`` /
+    ``failures_24h``, and its last run when systemd knows nothing (``unknown``: no
+    systemd on this machine, or the unit hasn't run since boot). The live state from
+    systemd wins otherwise."""
 
     unit: str
     name: str | None = None
     expected_every_minutes: float | None = 5
     where: str = "VPS"
     id: str | None = None
+    runs: str | Service | None = None
 
 
 @dataclass(frozen=True)
@@ -83,7 +97,8 @@ class SystemdTimer:
     """A systemd timer and the oneshot service it starts, reported as one service of
     kind ``timer``. ``service`` defaults to the timer's own name with ``.service``
     (systemd's default). ``id`` defaults to the timer unit and ``name`` to the id;
-    ``expected_every_minutes`` is the timer's cadence (a day by default)."""
+    ``expected_every_minutes`` is the timer's cadence (a day by default). ``runs``
+    names the service's own ``record_run`` history, as on :class:`SystemdUnit`."""
 
     timer: str
     service: str | None = None
@@ -91,6 +106,7 @@ class SystemdTimer:
     expected_every_minutes: float | None = 1440
     where: str = "VPS"
     id: str | None = None
+    runs: str | Service | None = None
 
     @property
     def service_unit(self) -> str:
@@ -121,7 +137,9 @@ def _timestamp(value: Any) -> str | None:
 
 
 def _short(text: Any) -> str | None:
-    return None if text is None else str(text)[:ERROR_CHARS]
+    """Error text as reported: redacted (orbit-jobs' rule: URL query strings,
+    credentials, token-like values), then cut."""
+    return None if text is None else redact(str(text))[:ERROR_CHARS]
 
 
 def _error_text(exc: BaseException) -> str:
@@ -195,6 +213,30 @@ def _show(unit: str, run: Runner, props: str = _PROPS) -> dict[str, str] | str:
     return props
 
 
+_RUN_FIELDS = ("last_run_at", "last_ok_at", "last_status", "last_error", "last_duration_ms")
+
+
+def _with_runs(item: dict[str, Any], spec: SystemdUnit | SystemdTimer,
+               now: datetime | None) -> dict[str, Any]:
+    """``item`` (live from systemd) with the 24-hour counts of the unit's recorded runs
+    (``spec.runs``), and their last run in place of an ``unknown`` live state."""
+    if spec.runs is None:
+        return item
+    runs = spec.runs if isinstance(spec.runs, Service) else Service(
+        spec.runs, expected_every_minutes=spec.expected_every_minutes)
+    try:
+        recorded = health([runs], now)[0]
+    except Exception as exc:  # noqa: BLE001 - never raise; the live state stands
+        if item["last_status"] == "unknown":
+            item["last_error"] = _short(f"{item['last_error'] or 'unknown'};"
+                                        f" recorded runs unreadable: {_error_text(exc)}")
+        return item
+    item.update(runs_24h=recorded["runs_24h"], failures_24h=recorded["failures_24h"])
+    if item["last_status"] == "unknown" and recorded["last_status"] != "unknown":
+        item.update(_service({**item, **{k: recorded[k] for k in _RUN_FIELDS}}))
+    return item
+
+
 def systemd_service(unit: SystemdUnit | str, *, now: datetime | None = None,
                     run: Runner = subprocess.run) -> dict[str, Any]:
     """One contract service for a systemd unit, from ``systemctl show``.
@@ -204,8 +246,13 @@ def systemd_service(unit: SystemdUnit | str, *, now: datetime | None = None,
     failure, ``unknown`` when systemctl or the unit is missing or the unit never ran.
     ``last_run_at`` is when it last started; ``last_ok_at`` is ``now`` while it is up
     and its clean exit time after one. ``runs_24h`` / ``failures_24h`` are None:
-    systemd doesn't count them. ``run`` is the subprocess runner (tests fake it)."""
+    systemd doesn't count them (unless the unit names its recorded ``runs``).
+    ``run`` is the subprocess runner (tests fake it)."""
     spec = SystemdUnit(unit) if isinstance(unit, str) else unit
+    return _with_runs(_systemd_service(spec, now, run), spec, now)
+
+
+def _systemd_service(spec: SystemdUnit, now: datetime | None, run: Runner) -> dict[str, Any]:
     fields = {"id": spec.id or spec.unit, "name": spec.name, "kind": "systemd",
               "where": spec.where, "expected_every_minutes": spec.expected_every_minutes}
     props = _show(spec.unit, run)
@@ -259,7 +306,13 @@ def systemd_timer_service(timer: SystemdTimer, *, now: datetime | None = None,
     next run (except while its service runs: a timer counting from its service's
     start, ``OnUnitActiveSec=``, schedules the next run only once it ends) or is overdue by :data:`TIMER_OVERDUE_MINUTES` makes the service
     ``failed`` with that reason (``last_ok_at`` stays the real last success, so a
-    collector also sees it late). ``runs_24h`` / ``failures_24h`` are None."""
+    collector also sees it late). ``runs_24h`` / ``failures_24h`` are None, unless
+    the timer names its service's recorded ``runs``."""
+    return _with_runs(_systemd_timer_service(timer, now, run), timer, now)
+
+
+def _systemd_timer_service(timer: SystemdTimer, now: datetime | None,
+                           run: Runner) -> dict[str, Any]:
     at = now or datetime.now(UTC)
     service_unit = timer.service_unit
     fields = {"id": timer.id or timer.timer, "name": timer.name, "kind": "timer",

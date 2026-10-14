@@ -12,7 +12,7 @@ Install it with uv from a git tag (it is not on PyPI):
 dependencies = ["app-server-basics[fastapi]"]
 
 [tool.uv.sources]
-app-server-basics = { git = "https://github.com/vixtah/app-server-basics", tag = "v0.2.0" }
+app-server-basics = { git = "https://github.com/vixtah/app-server-basics", tag = "v0.2.1" }
 ```
 
 It depends on [orbit-jobs](https://github.com/vixtah/orbit-jobs) (the shared job
@@ -57,6 +57,11 @@ It collects services from three places:
    `timer` (`SystemdTimer`): the last run, its length and outcome come from the
    service, and a timer that is stopped, disabled, missing or overdue is `failed`
    with that reason (its `last_ok_at` stays the real last success, never "now").
+   A unit or timer whose process also records its own runs with `record_run` (the
+   server's lifetime, each backup) names them with `runs=`: the report then has the
+   live state from systemd plus the 24-hour run and failure counts from those
+   records, and the recorded last run when systemd knows nothing (no systemd on the
+   machine, or no run since the last reboot).
 3. **Extra checks.** Any function that returns one service as a dict, for things
    the other two can't see.
 
@@ -67,7 +72,9 @@ only a failed last run counts. Declare it as
 refresh in `record_run`.
 
 The route never fails because one source is broken: that source's services show
-`unknown` with the reason. Errors are cut to 300 characters, timestamps are UTC,
+`unknown` with the reason. Errors are redacted with orbit-jobs' rule
+(`orbit_jobs.redact`: URL query strings, credentials and token-like values) and cut
+to 300 characters, timestamps are UTC,
 and each service carries exactly the contract's keys (anything else a check returns
 is dropped). Don't put secrets, payloads or message contents in a check's error.
 
@@ -85,7 +92,7 @@ SWEEPER = Service("fleet-sweeper", expected_every_minutes=2, title="Fleet sweepe
 app.include_router(heartbeats_router(
     "riftbound",
     entries=[*ENTRIES, SWEEPER],
-    units=[SystemdUnit("rift-lab.service", name="Training lab"),
+    units=[SystemdUnit("rift-lab.service", name="Training lab", runs="rift-lab"),
            SystemdTimer("rift-backup.timer", "rift-backup.service", name="Nightly backup",
                         expected_every_minutes=1440)],
     auth=require_admin,
@@ -120,18 +127,20 @@ the same response as a dict, `systemd_service(unit)` one systemd service and
   the whole response.
 - `heartbeats_router(app_name, *, entries=(), units=(), extra=(), auth, path="/heartbeats", where=None, tick_minutes=1)`:
   a FastAPI router serving it (needs the `fastapi` extra).
-- `SystemdUnit(unit, name=None, expected_every_minutes=5, where="VPS", id=None)`:
-  a unit to report (a plain unit name also works).
-- `SystemdTimer(timer, service=None, name=None, expected_every_minutes=1440, where="VPS", id=None)`:
+- `SystemdUnit(unit, name=None, expected_every_minutes=5, where="VPS", id=None, runs=None)`:
+  a unit to report (a plain unit name also works). `runs` is the orbit-jobs
+  `Service` (or its name) whose `record_run` history belongs to the unit.
+- `SystemdTimer(timer, service=None, name=None, expected_every_minutes=1440, where="VPS", id=None, runs=None)`:
   a timer and its oneshot service (`service` defaults to the timer's name with
-  `.service`, `id` to the timer unit), reported as one service of kind `timer`.
+  `.service`, `id` to the timer unit), reported as one service of kind `timer`;
+  `runs` as for a unit.
 - `systemd_service(unit, *, now=None)`: one unit's service;
   `systemd_timer_service(timer, *, now=None)`: one timer's.
 - `FIELDS`, `STATUSES`, `ERROR_CHARS`: the contract's keys, statuses and error length.
 
 Entries default to kind `scheduled` and services to `loop`, unless they declare
 `kind=`; `where` defaults to the app's `where=`. systemd doesn't count runs, so a
-unit's or timer's `runs_24h` and `failures_24h` are null. A timer whose service
+unit's or timer's `runs_24h` and `failures_24h` are null unless it names its `runs`. A timer whose service
 started before the last reboot has no recorded outcome: `unknown`, with
 `last_run_at` from the timer's last trigger.
 

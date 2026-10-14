@@ -435,3 +435,84 @@ def test_route_serves_the_report_behind_the_apps_auth():
 def test_route_requires_an_auth_dependency():
     with pytest.raises(TypeError):
         heartbeats_router("reserve", entries=[])  # type: ignore[call-arg]
+
+
+# ── a unit plus its own recorded runs (runs=) ─────────────────────────
+
+
+def _recorded(name: str) -> None:
+    from orbit_jobs.schedules import import_runs
+
+    import_runs([
+        {"name": name, "started_at": NOW - timedelta(hours=30), "status": "ok",
+         "finished_at": NOW - timedelta(hours=29)},
+        {"name": name, "started_at": NOW - timedelta(hours=5), "status": "failed",
+         "finished_at": NOW - timedelta(hours=5), "error": "boom https://h.test/x?token=abc"},
+        {"name": name, "started_at": NOW - timedelta(hours=2), "status": "ok",
+         "finished_at": NOW - timedelta(hours=1), "duration_ms": 3_600_000},
+    ], now=NOW)
+
+
+def test_unit_with_runs_adds_the_recorded_counts_to_the_live_state():
+    _recorded("reserve.service")
+    run = FakeSystemctl({"reserve.service": ACTIVE})
+    spec = SystemdUnit("reserve.service", name="Reserve server", runs="reserve.service")
+    s = systemd_service(spec, now=NOW, run=run)
+    assert_contract(s)
+    assert (s["last_status"], s["last_ok_at"], s["last_run_at"]) == (
+        "ok", "2026-10-13T22:00:00Z", "2026-10-12T08:00:00Z")  # systemd's, live
+    assert (s["runs_24h"], s["failures_24h"]) == (2, 1)
+    # Through the report too, and a plain unit still has no counts.
+    services = build_heartbeats("reserve", units=[spec, "other.service"], now=NOW,
+                                run=FakeSystemctl({"reserve.service": ACTIVE,
+                                                   "other.service": ACTIVE}))["services"]
+    assert [(x["runs_24h"], x["failures_24h"]) for x in services] == [(2, 1), (None, None)]
+
+
+def test_unit_with_runs_uses_the_recorded_run_when_systemd_knows_nothing(monkeypatch):
+    _recorded("reserve.service")
+    monkeypatch.setattr(hb.shutil, "which", lambda name: None)  # a Mac: no systemctl
+    s = systemd_service(SystemdUnit("reserve.service", runs=Service("reserve.service", 5)),
+                        now=NOW)
+    assert_contract(s)
+    assert s == {**s, "kind": "systemd", "last_status": "ok",
+                 "last_run_at": "2026-10-13T20:00:00Z", "last_ok_at": "2026-10-13T21:00:00Z",
+                 "last_error": "boom https://h.test/x", "last_duration_ms": 3_600_000,
+                 "runs_24h": 2, "failures_24h": 1}
+
+
+def test_timer_with_runs():
+    _recorded("cards-backup")
+    spec = SystemdTimer("cards-backup.timer", "cards-backup.service", id="cards-backup",
+                        runs="cards-backup")
+    s = timer(spec=spec)
+    assert (s["kind"], s["last_status"], s["last_ok_at"], s["runs_24h"], s["failures_24h"]) == (
+        "timer", "ok", "2026-10-13T11:39:38Z", 2, 1)
+    # After a reboot systemd has no outcome: the recorded run stands in.
+    rebooted = ONESHOT_OK.replace("Tue 2026-10-13 11:39:36 UTC", "").replace(
+        "Tue 2026-10-13 11:39:38 UTC", "")
+    s = timer(spec=spec, service_props=rebooted)
+    assert (s["last_status"], s["last_ok_at"], s["last_run_at"]) == (
+        "ok", "2026-10-13T21:00:00Z", "2026-10-13T20:00:00Z")
+
+
+def test_unreadable_runs_leave_the_live_state(monkeypatch):
+    def down(*args, **kwargs):
+        raise OSError("disk I/O error")
+
+    monkeypatch.setattr(hb, "health", down)
+    s = systemd_service(SystemdUnit("reserve.service", runs="reserve.service"), now=NOW,
+                        run=FakeSystemctl({"reserve.service": ACTIVE}))
+    assert (s["last_status"], s["runs_24h"]) == ("ok", None)
+    s = systemd_service(SystemdUnit("gone.service", runs="gone"), now=NOW, run=FakeSystemctl({}))
+    assert s["last_status"] == "unknown"
+    assert s["last_error"] == "unit not found; recorded runs unreadable: OSError: disk I/O error"
+
+
+def test_check_errors_are_redacted():
+    def leaky():
+        return {"id": "x", "last_status": "failed",
+                "last_error": "GET https://api.test/v1?key=SECRET Authorization: Bearer abc"}
+
+    s = build_heartbeats("app", extra=[leaky], now=NOW)["services"][0]
+    assert s["last_error"] == "GET https://api.test/v1 Authorization: Bearer [redacted]"
